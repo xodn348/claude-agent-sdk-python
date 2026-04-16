@@ -1768,6 +1768,13 @@ class ClaudeAgentOptions:
     header.
     """
 
+    rate_limit_max_retries: int = 3
+    """Maximum number of automatic retries for 429 rate limit errors.
+
+    Set to 0 to disable automatic retry. Retries use exponential backoff unless
+    a retry delay is available in the error payload.
+    """
+
 
 # SDK Control Protocol
 class SDKControlInterruptRequest(TypedDict):

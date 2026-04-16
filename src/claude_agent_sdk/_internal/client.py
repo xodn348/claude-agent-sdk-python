@@ -1,11 +1,16 @@
 """Internal client implementation."""
 
+import asyncio
 import json
+import logging
 import os
+import random
+import re
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
 from dataclasses import asdict, replace
 from typing import Any
 
+from .._errors import ProcessError, RateLimitError
 from ..types import (
     ClaudeAgentOptions,
     HookEvent,
@@ -23,6 +28,31 @@ from .session_resume import (
 from .session_store_validation import validate_session_store_options
 from .transport import Transport
 from .transport.subprocess_cli import SubprocessCLITransport
+
+logger = logging.getLogger(__name__)
+
+
+def _is_rate_limit_error(error: Exception) -> tuple[bool, float | None]:
+    """Return whether an exception represents a 429 rate limit and retry delay."""
+    retry_after: float | None = None
+    candidates = [str(error)]
+    stderr = getattr(error, "stderr", None)
+    if stderr:
+        candidates.append(str(stderr))
+
+    for text in candidates:
+        if "rate_limit_error" not in text and "429" not in text:
+            continue
+
+        retry_after_match = re.search(
+            r'"retryAfter"\s*:\s*(\d+(?:\.\d+)?)', text
+        ) or re.search(r'Retry-After["\s:]+(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+        if retry_after_match:
+            retry_after = float(retry_after_match.group(1))
+
+        return True, retry_after
+
+    return False, None
 
 
 class InternalClient:
@@ -120,109 +150,152 @@ class InternalClient:
                 configured_options, materialized
             )
 
-        # Use provided transport or create subprocess transport
-        if transport is not None:
-            chosen_transport = transport
-        else:
-            chosen_transport = SubprocessCLITransport(
-                prompt=prompt,
-                options=configured_options,
-            )
+        max_retries = configured_options.rate_limit_max_retries
+        attempt = 0
 
-        # Connect transport
-        await chosen_transport.connect()
+        while True:
+            chosen_transport: Transport | None = None
+            query: Query | None = None
 
-        # Extract SDK MCP servers from configured options
-        sdk_mcp_servers = {}
-        if configured_options.mcp_servers and isinstance(
-            configured_options.mcp_servers, dict
-        ):
-            for name, config in configured_options.mcp_servers.items():
-                if isinstance(config, dict) and config.get("type") == "sdk":
-                    sdk_mcp_servers[name] = config["instance"]  # type: ignore[typeddict-item]
+            try:
+                # Use provided transport or create subprocess transport
+                if transport is not None:
+                    chosen_transport = transport
+                else:
+                    chosen_transport = SubprocessCLITransport(
+                        prompt=prompt,
+                        options=configured_options,
+                    )
 
-        # Extract exclude_dynamic_sections from preset system prompt for the
-        # initialize request (older CLIs ignore unknown initialize fields).
-        exclude_dynamic_sections: bool | None = None
-        sp = configured_options.system_prompt
-        if isinstance(sp, dict) and sp.get("type") == "preset":
-            eds = sp.get("exclude_dynamic_sections")
-            if isinstance(eds, bool):
-                exclude_dynamic_sections = eds
+                # Connect transport
+                await chosen_transport.connect()
 
-        # Convert agents to dict format for initialize request
-        agents_dict = None
-        if configured_options.agents:
-            agents_dict = {
-                name: {k: v for k, v in asdict(agent_def).items() if v is not None}
-                for name, agent_def in configured_options.agents.items()
-            }
+                # Extract SDK MCP servers from configured options
+                sdk_mcp_servers = {}
+                if configured_options.mcp_servers and isinstance(
+                    configured_options.mcp_servers, dict
+                ):
+                    for name, config in configured_options.mcp_servers.items():
+                        if isinstance(config, dict) and config.get("type") == "sdk":
+                            sdk_mcp_servers[name] = config["instance"]  # type: ignore[typeddict-item]
 
-        # Match ClaudeSDKClient.connect() — without this, query() ignores the env var
-        initialize_timeout_ms = int(
-            os.environ.get("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "60000")
-        )
-        initialize_timeout = max(initialize_timeout_ms / 1000.0, 60.0)
+                # Extract exclude_dynamic_sections from preset system prompt for the
+                # initialize request (older CLIs ignore unknown initialize fields).
+                exclude_dynamic_sections: bool | None = None
+                sp = configured_options.system_prompt
+                if isinstance(sp, dict) and sp.get("type") == "preset":
+                    eds = sp.get("exclude_dynamic_sections")
+                    if isinstance(eds, bool):
+                        exclude_dynamic_sections = eds
 
-        # Create Query to handle control protocol
-        # Always use streaming mode internally (matching TypeScript SDK)
-        # This ensures agents are always sent via initialize request
-        query = Query(
-            transport=chosen_transport,
-            is_streaming_mode=True,  # Always streaming internally
-            can_use_tool=configured_options.can_use_tool,
-            hooks=self._convert_hooks_to_internal_format(configured_options.hooks)
-            if configured_options.hooks
-            else None,
-            sdk_mcp_servers=sdk_mcp_servers,
-            initialize_timeout=initialize_timeout,
-            agents=agents_dict,
-            exclude_dynamic_sections=exclude_dynamic_sections,
-            skills=configured_options.skills,
-        )
+                # Convert agents to dict format for initialize request
+                agents_dict = None
+                if configured_options.agents:
+                    agents_dict = {
+                        name: {
+                            k: v for k, v in asdict(agent_def).items() if v is not None
+                        }
+                        for name, agent_def in configured_options.agents.items()
+                    }
 
-        if configured_options.session_store is not None:
-
-            async def _on_mirror_error(key: Any, error: str) -> None:
-                query.report_mirror_error(key, error)
-
-            query.set_transcript_mirror_batcher(
-                build_mirror_batcher(
-                    store=configured_options.session_store,
-                    materialized=materialized,
-                    env=configured_options.env,
-                    on_error=_on_mirror_error,
+                # Match ClaudeSDKClient.connect() — without this, query() ignores the env var
+                initialize_timeout_ms = int(
+                    os.environ.get("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "60000")
                 )
-            )
+                initialize_timeout = max(initialize_timeout_ms / 1000.0, 60.0)
 
-        try:
-            # Start reading messages
-            await query.start()
+                # Create Query to handle control protocol
+                # Always use streaming mode internally (matching TypeScript SDK)
+                # This ensures agents are always sent via initialize request
+                query = Query(
+                    transport=chosen_transport,
+                    is_streaming_mode=True,  # Always streaming internally
+                    can_use_tool=configured_options.can_use_tool,
+                    hooks=self._convert_hooks_to_internal_format(
+                        configured_options.hooks
+                    )
+                    if configured_options.hooks
+                    else None,
+                    sdk_mcp_servers=sdk_mcp_servers,
+                    initialize_timeout=initialize_timeout,
+                    agents=agents_dict,
+                    exclude_dynamic_sections=exclude_dynamic_sections,
+                    skills=configured_options.skills,
+                )
 
-            # Always initialize to send agents via stdin (matching TypeScript SDK)
-            await query.initialize()
+                if configured_options.session_store is not None:
+                    mirror_query = query
 
-            # Handle prompt input
-            if isinstance(prompt, str):
-                # For string prompts, write user message to stdin after initialize
-                # (matching TypeScript SDK behavior)
-                user_message = {
-                    "type": "user",
-                    "session_id": "",
-                    "message": {"role": "user", "content": prompt},
-                    "parent_tool_use_id": None,
-                }
-                await chosen_transport.write(json.dumps(user_message) + "\n")
-                query.spawn_task(query.wait_for_result_and_end_input())
-            elif isinstance(prompt, AsyncIterable):
-                # Stream input in background for async iterables
-                query.spawn_task(query.stream_input(prompt))
+                    async def _on_mirror_error(key: Any, error: str, q: Query = mirror_query) -> None:
+                        q.report_mirror_error(key, error)
 
-            # Yield parsed messages, skipping unknown message types
-            async for data in query.receive_messages():
-                message = parse_message(data)
-                if message is not None:
-                    yield message
+                    query.set_transcript_mirror_batcher(
+                        build_mirror_batcher(
+                            store=configured_options.session_store,
+                            materialized=materialized,
+                            env=configured_options.env,
+                            on_error=_on_mirror_error,
+                        )
+                    )
 
-        finally:
-            await query.close()
+                # Start reading messages
+                await query.start()
+
+                # Always initialize to send agents via stdin (matching TypeScript SDK)
+                await query.initialize()
+
+                # Handle prompt input
+                if isinstance(prompt, str):
+                    # For string prompts, write user message to stdin after initialize
+                    # (matching TypeScript SDK behavior)
+                    user_message = {
+                        "type": "user",
+                        "session_id": "",
+                        "message": {"role": "user", "content": prompt},
+                        "parent_tool_use_id": None,
+                    }
+                    await chosen_transport.write(json.dumps(user_message) + "\n")
+                    query.spawn_task(query.wait_for_result_and_end_input())
+                elif isinstance(prompt, AsyncIterable):
+                    # Stream input in background for async iterables
+                    query.spawn_task(query.stream_input(prompt))
+
+                # Yield parsed messages, skipping unknown message types
+                async for data in query.receive_messages():
+                    message = parse_message(data)
+                    if message is not None:
+                        yield message
+
+                return
+
+            except ProcessError as e:
+                is_rate_limit, retry_after = _is_rate_limit_error(e)
+                if not is_rate_limit:
+                    raise
+
+                if attempt >= max_retries:
+                    raise RateLimitError(
+                        str(e),
+                        retry_after=retry_after,
+                        original_error=e,
+                    ) from e
+
+                attempt += 1
+                delay = retry_after
+                if delay is None:
+                    delay = min(2.0 * (2 ** (attempt - 1)), 60.0)
+                    delay += random.uniform(0, 1)
+
+                logger.warning(
+                    "Rate limit hit (attempt %d/%d). Retrying in %.1fs.",
+                    attempt,
+                    max_retries,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+            finally:
+                if query is not None:
+                    await query.close()
+                elif chosen_transport is not None:
+                    await chosen_transport.close()

@@ -59,6 +59,7 @@ class SubprocessCLITransport(Transport):
             else _DEFAULT_MAX_BUFFER_SIZE
         )
         self._write_lock: anyio.Lock = anyio.Lock()
+        self._stderr_lines: list[str] = []
 
     def _find_cli(self) -> str:
         """Find Claude Code CLI binary."""
@@ -444,14 +445,11 @@ class SubprocessCLITransport(Transport):
             if self._cwd:
                 process_env["PWD"] = self._cwd
 
-            # Pipe stderr only when the caller registered a callback.
-            stderr_dest = PIPE if self._options.stderr is not None else None
-
             self._process = await anyio.open_process(
                 cmd,
                 stdin=PIPE,
                 stdout=PIPE,
-                stderr=stderr_dest,
+                stderr=PIPE,
                 cwd=self._cwd,
                 env=process_env,
                 user=self._options.user,
@@ -460,8 +458,9 @@ class SubprocessCLITransport(Transport):
             if self._process.stdout:
                 self._stdout_stream = TextReceiveStream(self._process.stdout)
 
-            # Setup stderr stream if piped
-            if stderr_dest is PIPE and self._process.stderr:
+            # Always pipe stderr so process errors can include the CLI payload
+            # (including recoverable API errors such as 429 rate limits).
+            if self._process.stderr:
                 self._stderr_stream = TextReceiveStream(self._process.stderr)
                 # Start async task to read stderr
                 self._stderr_task_group = anyio.create_task_group()
@@ -500,6 +499,8 @@ class SubprocessCLITransport(Transport):
                 line_str = line.rstrip()
                 if not line_str:
                     continue
+
+                self._stderr_lines.append(line_str)
 
                 # Call the stderr callback if provided
                 if self._options.stderr:
@@ -671,10 +672,11 @@ class SubprocessCLITransport(Transport):
 
         # Use exit code for error detection
         if returncode is not None and returncode != 0:
+            stderr = "\n".join(self._stderr_lines) or "Check stderr output for details"
             self._exit_error = ProcessError(
                 f"Command failed with exit code {returncode}",
                 exit_code=returncode,
-                stderr="Check stderr output for details",
+                stderr=stderr,
             )
             raise self._exit_error
 
