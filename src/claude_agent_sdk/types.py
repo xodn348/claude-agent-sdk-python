@@ -855,12 +855,20 @@ class SandboxSettings(TypedDict, total=False):
     enableWeakerNestedSandbox: bool
 
 
+def _truncate(s: str, max_len: int = 100) -> str:
+    """Truncate a string to max_len chars, appending '...' if truncated."""
+    return s if len(s) <= max_len else s[:max_len] + "..."
+
+
 # Content block types
 @dataclass
 class TextBlock:
     """Text content block."""
 
     text: str
+
+    def __repr__(self) -> str:
+        return f"TextBlock(text={_truncate(self.text)!r})"
 
 
 @dataclass
@@ -869,6 +877,9 @@ class ThinkingBlock:
 
     thinking: str
     signature: str
+
+    def __repr__(self) -> str:
+        return f"ThinkingBlock(thinking={_truncate(self.thinking)!r})"
 
 
 @dataclass
@@ -879,6 +890,10 @@ class ToolUseBlock:
     name: str
     input: dict[str, Any]
 
+    def __repr__(self) -> str:
+        input_repr = _truncate(repr(self.input))
+        return f"ToolUseBlock(id={self.id!r}, name={self.name!r}, input={input_repr})"
+
 
 @dataclass
 class ToolResultBlock:
@@ -887,6 +902,10 @@ class ToolResultBlock:
     tool_use_id: str
     content: str | list[dict[str, Any]] | None = None
     is_error: bool | None = None
+
+    def __repr__(self) -> str:
+        content_repr = _truncate(repr(self.content))
+        return f"ToolResultBlock(tool_use_id={self.tool_use_id!r}, is_error={self.is_error!r}, content={content_repr})"
 
 
 ServerToolName = Literal[
@@ -915,6 +934,10 @@ class ServerToolUseBlock:
     name: ServerToolName
     input: dict[str, Any]
 
+    def __repr__(self) -> str:
+        input_repr = _truncate(repr(self.input))
+        return f"ServerToolUseBlock(id={self.id!r}, name={self.name!r}, input={input_repr})"
+
 
 @dataclass
 class ServerToolResultBlock:
@@ -927,6 +950,10 @@ class ServerToolResultBlock:
 
     tool_use_id: str
     content: dict[str, Any]
+
+    def __repr__(self) -> str:
+        content_repr = _truncate(repr(self.content))
+        return f"ServerToolResultBlock(tool_use_id={self.tool_use_id!r}, content={content_repr})"
 
 
 ContentBlock = (
@@ -959,6 +986,14 @@ class UserMessage:
     parent_tool_use_id: str | None = None
     tool_use_result: dict[str, Any] | None = None
 
+    def __repr__(self) -> str:
+        content_summary = (
+            f"[{len(self.content)} items]"
+            if isinstance(self.content, list)
+            else _truncate(repr(self.content))
+        )
+        return f"UserMessage(content={content_summary}, uuid={self.uuid!r})"
+
 
 @dataclass
 class AssistantMessage:
@@ -974,6 +1009,12 @@ class AssistantMessage:
     session_id: str | None = None
     uuid: str | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"AssistantMessage(model={self.model!r}, stop_reason={self.stop_reason!r},"
+            f" content=[{len(self.content)} items])"
+        )
+
 
 @dataclass
 class SystemMessage:
@@ -981,6 +1022,9 @@ class SystemMessage:
 
     subtype: str
     data: dict[str, Any]
+
+    def __repr__(self) -> str:
+        return f"SystemMessage(subtype={self.subtype!r}, data={_truncate(repr(self.data))})"
 
 
 class TaskUsage(TypedDict):
@@ -1011,6 +1055,9 @@ class TaskStartedMessage(SystemMessage):
     tool_use_id: str | None = None
     task_type: str | None = None
 
+    def __repr__(self) -> str:
+        return f"TaskStartedMessage(subtype={self.subtype!r}, session_id={self.session_id!r})"
+
 
 @dataclass
 class TaskProgressMessage(SystemMessage):
@@ -1028,6 +1075,9 @@ class TaskProgressMessage(SystemMessage):
     session_id: str
     tool_use_id: str | None = None
     last_tool_name: str | None = None
+
+    def __repr__(self) -> str:
+        return f"TaskProgressMessage(subtype={self.subtype!r}, description={_truncate(self.description)})"
 
 
 @dataclass
@@ -1048,6 +1098,11 @@ class TaskNotificationMessage(SystemMessage):
     tool_use_id: str | None = None
     usage: TaskUsage | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"TaskNotificationMessage(subtype={self.subtype!r}, status={self.status!r})"
+        )
+
 
 @dataclass
 class MirrorErrorMessage(SystemMessage):
@@ -1064,6 +1119,9 @@ class MirrorErrorMessage(SystemMessage):
 
     key: "SessionKey | None" = None
     error: str = ""
+
+    def __repr__(self) -> str:
+        return f"MirrorErrorMessage(subtype={self.subtype!r}, error={_truncate(self.error)})"
 
 
 @dataclass
@@ -1086,6 +1144,12 @@ class ResultMessage:
     errors: list[str] | None = None
     uuid: str | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"ResultMessage(subtype={self.subtype!r}, is_error={self.is_error!r},"
+            f" duration_ms={self.duration_ms!r}, session_id={self.session_id!r})"
+        )
+
 
 @dataclass
 class StreamEvent:
@@ -1095,6 +1159,10 @@ class StreamEvent:
     session_id: str
     event: dict[str, Any]  # The raw Anthropic API stream event
     parent_tool_use_id: str | None = None
+
+    def __repr__(self) -> str:
+        event_type = self.event.get("type")
+        return f"StreamEvent(event_type={event_type!r}, session_id={self.session_id!r})"
 
 
 # Rate limit types — see https://docs.claude.com/en/docs/claude-code/rate-limits
@@ -1129,6 +1197,9 @@ class RateLimitInfo:
     overage_disabled_reason: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
+    def __repr__(self) -> str:
+        return f"RateLimitInfo(status={self.status!r}, raw={_truncate(repr(self.raw))})"
+
 
 @dataclass
 class RateLimitEvent:
@@ -1142,6 +1213,9 @@ class RateLimitEvent:
     rate_limit_info: RateLimitInfo
     uuid: str
     session_id: str
+
+    def __repr__(self) -> str:
+        return f"RateLimitEvent(rate_limit_info={self.rate_limit_info!r})"
 
 
 Message = (
