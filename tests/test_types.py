@@ -841,3 +841,37 @@ class TestRepr:
         assert "RateLimitInfo(" in r
         assert "rejected" in r
 
+    def test_tool_use_block_repr_truncation(self) -> None:
+        """ToolUseBlock repr truncates large input dicts with '...'."""
+        obj = ToolUseBlock(id="x", name="fn", input={"k": "a" * 200})
+        r = repr(obj)
+        assert "ToolUseBlock" in repr(obj)
+        assert "..." in r
+
+    def test_tool_result_block_repr_truncation(self) -> None:
+        """ToolResultBlock repr truncates large content with '...'."""
+        obj = ToolResultBlock(tool_use_id="x", content=["a" * 200], is_error=False)
+        r = repr(obj)
+        assert "ToolResultBlock" in repr(obj)
+        assert "..." in r
+
+    def test_repr_none_fields(self) -> None:
+        """ToolResultBlock repr renders None fields as 'None'."""
+        obj = ToolResultBlock(tool_use_id="x", content=None, is_error=None)
+        r = repr(obj)
+        assert "ToolResultBlock" in r
+        assert "None" in r
+
+    def test_repr_empty_list(self) -> None:
+        """UserMessage repr with empty list content shows [0 items]."""
+        obj = UserMessage(content=[])
+        r = repr(obj)
+        assert "UserMessage" in r
+        assert "[0 items]" in r
+
+    def test_repr_unicode(self) -> None:
+        """TextBlock repr preserves unicode content correctly."""
+        obj = TextBlock(text="こんにちは世界")
+        r = repr(obj)
+        assert "TextBlock" in r
+        assert "こんにちは世界" in r
